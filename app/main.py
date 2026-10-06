@@ -47,6 +47,10 @@ class RouteRequest(BaseModel):
     route_id: str
 
 
+class PendingCancel(BaseModel):
+    pending_id: int
+
+
 class ResetRequest(BaseModel):
     instance_id: int
 
@@ -73,6 +77,19 @@ async def post_yard(request: Request) -> dict:
 def post_route(body: RouteRequest) -> dict:
     with _db_lock:
         return il.request_route(_conn, body.route_id)
+
+
+@app.post("/api/pending")
+def post_pending(body: RouteRequest) -> dict:
+    """提交待行申请；同一进路已有等待中项时幂等返回原申请。"""
+    with _db_lock:
+        return il.submit_pending(_conn, body.route_id)
+
+
+@app.post("/api/pending/cancel")
+def post_pending_cancel(body: PendingCancel) -> dict:
+    with _db_lock:
+        return il.cancel_pending(_conn, body.pending_id)
 
 
 @app.post("/api/events")

@@ -48,6 +48,12 @@
       </section>
 
       <section class="panel">
+        <h2>待行队列</h2>
+        <div id="pendingList" class="pending-list"><p class="muted">无待行申请</p></div>
+        <div id="pendingResult" class="result small"></div>
+      </section>
+
+      <section class="panel">
         <h2>检测上报</h2>
         <div class="form-row">
           <label>检测器</label>
@@ -84,6 +90,7 @@
           <option value="">全部类型</option>
           <option value="import">导入</option>
           <option value="approval">放行</option>
+          <option value="pending">待行</option>
           <option value="event">事件</option>
           <option value="fault">故障</option>
           <option value="complete">完成</option>

@@ -4,8 +4,8 @@
 
 * 只增日志（``events``、``event_results``、``approvals``、``decisions``），
   由触发器禁止 UPDATE/DELETE，已发放行与事件记录不可追溯改写；
-* 可变运行态（``instances``、``locks``、``occupancy``），始终可由事件日志
-  回放重建，重启后直接读出即可恢复当前锁闭状态。
+* 可变运行态（``instances``、``locks``、``occupancy``、``pending_requests``），
+  始终可由事件日志回放重建，重启后直接读出即可恢复当前锁闭与待行队列。
 """
 
 from __future__ import annotations
@@ -133,6 +133,18 @@ CREATE TABLE IF NOT EXISTS occupancy (
     occupied    INTEGER NOT NULL,
     PRIMARY KEY (yard_id, section_id)
 );
+-- 待行进路队列（运行态：waiting -> granted | cancelled 单向流转）
+CREATE TABLE IF NOT EXISTS pending_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    yard_id     TEXT NOT NULL,
+    route_id    TEXT NOT NULL,
+    status      TEXT NOT NULL,          -- waiting | granted | cancelled
+    approval_id INTEGER,                -- 兑现时生成的批准号
+    instance_id INTEGER,                -- 兑现时建立的进路实例
+    created_at  REAL NOT NULL,
+    resolved_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_waiting ON pending_requests(yard_id, status, id);
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL

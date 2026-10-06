@@ -95,3 +95,53 @@ def test_gap_and_fault_api(client, yard_dict):
     # 占用中不能复位
     blocked = client.post("/api/reset", json={"instance_id": iid})
     assert blocked.status_code == 409
+
+
+def test_pending_queue_api(client, yard_dict):
+    client.post("/api/yard", json=yard_dict)
+    # 空闲时提交待行 -> 立即自动放行
+    r = client.post("/api/pending", json={"route_id": "R-MAIN"}).json()
+    assert r["status"] == "granted" and r["instance_id"]
+    # 冲突时提交 -> 等待；重复提交幂等返回原申请
+    r2 = client.post("/api/pending", json={"route_id": "R-SIDING"}).json()
+    assert r2["status"] == "waiting"
+    dup = client.post("/api/pending", json={"route_id": "R-SIDING"}).json()
+    assert dup["duplicate"] is True and dup["id"] == r2["id"]
+    # 快照包含队列
+    state = client.get("/api/state").json()
+    assert [p["status"] for p in state["pending"]] == ["granted", "waiting"]
+    # 未决待行项存在时拒绝重导站场（此处同时有活动实例，具体码以运行态为准；
+    # 仅有未决待行项时的 pending_waiting 拒绝见单元测试）
+    busy = client.post("/api/yard", json=yard_dict)
+    assert busy.status_code == 409
+    # 主进路跑完后等待项自动放行
+    seq = 1
+    dets = ["D0", "D1", "D2", "D3"]
+    for i, d in enumerate(dets):
+        client.post("/api/events", json={"seq": seq, "detector_id": d, "kind": "occupy"})
+        seq += 1
+        if i > 0:
+            client.post("/api/events", json={"seq": seq, "detector_id": dets[i - 1], "kind": "clear"})
+            seq += 1
+    fin = client.post("/api/events", json={"seq": seq, "detector_id": "D3", "kind": "clear"}).json()
+    assert [g["pending_id"] for g in fin["granted_pending"]] == [r2["id"]]
+    state = client.get("/api/state").json()
+    assert [p["status"] for p in state["pending"]] == ["granted", "granted"]
+    # 已放行项不可撤销
+    r3 = client.post("/api/pending/cancel", json={"pending_id": r2["id"]})
+    assert r3.status_code == 409
+
+
+def test_pending_cancel_api(client, yard_dict):
+    client.post("/api/yard", json=yard_dict)
+    client.post("/api/routes/request", json={"route_id": "R-MAIN"})
+    r = client.post("/api/pending", json={"route_id": "R-SIDING"}).json()
+    assert r["status"] == "waiting"
+    c = client.post("/api/pending/cancel", json={"pending_id": r["id"]}).json()
+    assert c["status"] == "cancelled"
+    again = client.post("/api/pending/cancel", json={"pending_id": r["id"]})
+    assert again.status_code == 409
+    state = client.get("/api/state").json()
+    assert state["pending"][0]["status"] == "cancelled"
+    # 未知进路 404
+    assert client.post("/api/pending", json={"route_id": "GHOST"}).status_code == 404
