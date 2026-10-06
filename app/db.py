@@ -133,6 +133,18 @@ CREATE TABLE IF NOT EXISTS occupancy (
     occupied    INTEGER NOT NULL,
     PRIMARY KEY (yard_id, section_id)
 );
+-- 待行进路队列（可变运行态：等待中入队，自动放行/撤销后终结；重导站场时清空）
+CREATE TABLE IF NOT EXISTS pending_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    yard_id     TEXT NOT NULL,
+    route_id    TEXT NOT NULL,
+    status      TEXT NOT NULL,          -- waiting | granted | revoked
+    approval_id INTEGER,                -- granted：兑现时的只增批准号
+    instance_id INTEGER,                -- granted：兑现时建立的进路实例
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_requests(yard_id, status, id);
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL

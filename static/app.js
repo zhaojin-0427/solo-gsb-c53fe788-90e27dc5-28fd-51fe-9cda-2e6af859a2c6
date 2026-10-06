@@ -162,7 +162,10 @@ function renderRoutes() {
     const req = document.createElement('button');
     req.className = 'btn primary'; req.textContent = '申请放行';
     req.onclick = () => requestRoute(r.id, req);
-    actions.append(sel, req);
+    const pend = document.createElement('button');
+    pend.className = 'btn'; pend.textContent = '待行申请';
+    pend.onclick = () => submitPending(r.id, pend);
+    actions.append(sel, req, pend);
     div.appendChild(actions);
     box.appendChild(div);
   });
@@ -183,6 +186,77 @@ async function requestRoute(routeId, btn) {
     await refresh();
   } catch (e) {
     $('approvalResult').innerHTML = `<div class="bad">⛔ ${e.message}</div><pre>${JSON.stringify(e.body?.error || {}, null, 2)}</pre>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------------- 待行进路队列 ---------------- */
+function pendingStatusText(s) {
+  return { waiting: '等待中', granted: '自动放行', revoked: '已撤销' }[s] || s;
+}
+
+function renderPending() {
+  const box = $('pendingList');
+  if (!box) return;
+  box.innerHTML = '';
+  const snap = state.snap;
+  const items = (snap && snap.pending) || [];
+  const waiting = items.filter((p) => p.status === 'waiting');
+  $('pendingHint').textContent = waiting.length ? `${waiting.length} 项等待` : '';
+  if (!items.length) { box.innerHTML = '<p class="muted">无</p>'; return; }
+  // 最新在前，等待项置顶
+  [...items].sort((a, b) => (a.status === b.status ? b.id - a.id : a.status === 'waiting' ? -1 : 1))
+    .forEach((p) => {
+      const div = document.createElement('div');
+      div.className = `pend ${p.status}`;
+      const line1 = document.createElement('div');
+      line1.className = 'line1';
+      line1.innerHTML = `<span>#${p.id} ${p.route_id}</span><span class="badge pending-${p.status}">${pendingStatusText(p.status)}</span>`;
+      div.appendChild(line1);
+      const sub = document.createElement('div');
+      sub.className = 'meta2';
+      sub.textContent = p.status === 'granted'
+        ? `实例 #${p.instance_id}　批准号 ${p.approval_id}`
+        : `${fmtTime(p.created_at)} 提交${p.status === 'revoked' ? '，已撤销' : ''}`;
+      div.appendChild(sub);
+      if (p.status === 'waiting') {
+        const btn = document.createElement('button');
+        btn.className = 'btn danger'; btn.style.marginTop = '5px';
+        btn.textContent = '撤销';
+        btn.onclick = () => revokePending(p.id, btn);
+        div.appendChild(btn);
+      }
+      box.appendChild(div);
+    });
+}
+
+async function submitPending(routeId, btn) {
+  btn.disabled = true;
+  try {
+    const r = await api('/api/routes/pending', { method: 'POST', body: JSON.stringify({ route_id: routeId }) });
+    const box = $('approvalResult');
+    if (r.status === 'granted') {
+      box.innerHTML = `<div class="ok">🟢 待行 #${r.id}（${r.route_id}）已自动放行，实例 #${r.instance_id}，批准号 ${r.approval_id}</div>`;
+    } else {
+      box.innerHTML = `<div class="warn">⏳ 待行申请 #${r.id}（${r.route_id}）已入队等待${r.duplicate ? '（重复提交，返回原申请）' : ''}</div>`;
+    }
+    await refresh();
+  } catch (e) {
+    $('approvalResult').innerHTML = `<div class="bad">⛔ ${e.message}</div><pre>${JSON.stringify(e.body?.error || {}, null, 2)}</pre>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function revokePending(id, btn) {
+  btn.disabled = true;
+  try {
+    const r = await api('/api/routes/pending/revoke', { method: 'POST', body: JSON.stringify({ pending_id: id }) });
+    $('eventResult').innerHTML = `<div class="ok">待行申请 #${r.id} 已撤销${r.granted && r.granted.length ? `；顺带自动放行 ${r.granted.length} 项：${r.granted.map((g) => `#${g.pending_id} ${g.route_id}`).join('，')}` : ''}</div>`;
+    await refresh();
+  } catch (e) {
+    $('eventResult').innerHTML = `<div class="bad">撤销被拒：${e.message}</div><pre>${JSON.stringify(e.body?.error || {}, null, 2)}</pre>`;
   } finally {
     btn.disabled = false;
   }
@@ -236,7 +310,8 @@ function renderInstances() {
       btn.onclick = async () => {
         try {
           const r = await api('/api/reset', { method: 'POST', body: JSON.stringify({ instance_id: i.id }) });
-          $('eventResult').innerHTML = `<div class="ok">实例 #${r.instance_id} 已复位</div>`;
+          const granted = r.granted_pending || [];
+          $('eventResult').innerHTML = `<div class="ok">实例 #${r.instance_id} 已复位${granted.length ? `；待行自动放行：${granted.map((g) => `#${g.pending_id} ${g.route_id}（实例 #${g.instance_id}）`).join('；')}` : ''}</div>`;
           await refresh();
         } catch (e) {
           $('eventResult').innerHTML = `<div class="bad">复位被拒：${e.message}</div><pre>${JSON.stringify(e.body?.error || {}, null, 2)}</pre>`;
@@ -264,8 +339,10 @@ $('sendEventBtn')?.addEventListener('click', async () => {
       $('eventResult').innerHTML = `<div class="ok">#${r.seq} 幂等重复（${r.status}${r.fault ? '，故障' : ''}）</div>`;
     } else {
       const faults = (r.processed || []).filter((x) => x.fault).length;
+      const granted = r.granted_pending || [];
       $('eventResult').innerHTML = `<div class="${faults ? 'bad' : 'ok'}">✓ 处理至 #${r.expected - 1}（本批 ${r.drained || 1} 条${faults ? `，${faults} 条触发故障` : ''}）</div>
-        <pre>${(r.processed || []).map((x) => `#${x.seq} ${x.detector_id} ${x.kind} → ${x.state?.event || ''}${x.fault ? ' 【故障锁闭 ' + (x.route_id || '') + '】' : ''}`).join('\n')}</pre>`;
+        <pre>${(r.processed || []).map((x) => `#${x.seq} ${x.detector_id} ${x.kind} → ${x.state?.event || ''}${x.fault ? ' 【故障锁闭 ' + (x.route_id || '') + '】' : ''}`).join('\n')}</pre>
+        ${granted.length ? `<div class="ok">🟢 待行自动放行：${granted.map((g) => `#${g.pending_id} ${g.route_id}（实例 #${g.instance_id}）`).join('；')}</div>` : ''}`;
       $('seqInput').value = r.expected;
     }
     await refresh();
@@ -313,7 +390,7 @@ function renderLog() {
   state.log.forEach((d) => {
     const tr = document.createElement('tr');
     if (d.kind === 'fault' || d.detail?.decision === 'denied') tr.className = 'bad';
-    const tagText = { import: '导入', approval: '放行', event: '事件', fault: '故障', complete: '完成', reset: '复位' }[d.kind] || d.kind;
+    const tagText = { import: '导入', approval: '放行', event: '事件', fault: '故障', complete: '完成', reset: '复位', pending: '待行' }[d.kind] || d.kind;
     tr.innerHTML = `<td>${d.id}</td><td><span class="tag ${d.kind}">${tagText}</span></td>
       <td>${d.route_id || ''}${d.instance_id ? ` #${d.instance_id}` : ''}</td>
       <td>${d.summary}</td><td>${fmtTime(d.created_at)}</td>`;
@@ -410,6 +487,7 @@ function highlightDecision(d) {
 function renderAll() {
   renderYard();
   renderRoutes();
+  renderPending();
   renderDetectors();
   renderInstances();
   renderSeqStatus();

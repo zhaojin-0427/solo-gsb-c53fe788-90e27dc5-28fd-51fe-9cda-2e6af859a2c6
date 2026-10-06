@@ -23,7 +23,10 @@ docker compose up -d --build
 - 健康检查：<http://localhost:8000/api/health>
 
 数据库位于容器内 `/data/interlocking.db`，映射到 Docker 命名卷
-`interlocking-data`；容器重启后当前锁闭、占用与历史裁决均保留。
+`interlocking-data`；容器重启后当前锁闭、占用、**待行队列**与历史裁决均保留。
+
+待行进路队列随服务一并启动，无需额外组件：启动后在页面右侧“**待行进路队列**”
+卡片操作，或调用 `/api/routes/pending`、`/api/routes/pending/revoke`。
 
 停止：
 
@@ -139,20 +142,50 @@ curl -s -X POST http://localhost:8000/api/yard \
 4. **故障复位**：须确认进路**全段空闲**（无占用、无他人锁），且无缺号；
    复位解除锁闭并关闭故障实例。
 
-5. **不可追溯改写**：`events / event_results / approvals / decisions` 为只增表，
+5. **待行进路队列**：调度员在站场图对进路点“**待行申请**”，服务端入队并
+   立即按最新状态尝试兑现；页面队列卡片显示三种状态——**等待中 / 自动放行 /
+   已撤销**。
+   - **试探与批准同一事务、共用同一套资源判定**：等待试探是纯只读核验
+     （区段空闲 + 区段/道岔/侧防锁未被占），**试探受阻不写任何只增拒绝
+     记录**；无冲突时在同一个 `BEGIN IMMEDIATE` 事务内原子建立只增批准、
+     进路实例与全部区段/道岔/侧防锁。因此**重试不会产生假拒绝**，成功时
+     实例与各类锁要么全部建立要么全部回滚。
+   - **FIFO 越过规则**：按申请序号扫描；较早申请受阻时，其后申请**仅在
+     既不与实际占用/锁冲突、也不与任一受阻前项争用资源**时才可越过放行，
+     否则一并等待。
+   - **缺号期间全部等待**：缺号缓冲存在时不兑现任何待行项；检测上报按
+     全站连续序号在**同一事务内整批排空缓冲**、更新占用与锁后，依据最新
+     状态尝试兑现。
+   - **故障持锁继续等待**：故障实例保留全部锁，与其冲突的待行项继续等待；
+     待**全段空闲人工复位成功**（同事务释放锁）后再尝试兑现。
+   - **幂等与撤销**：同一进路已有未决（等待中）待行项时，重复提交返回原
+     申请；未放行项可**撤销**，撤销后按最新状态再兑现一轮；已放行/已撤销
+     项不可再撤销（409）。待行入队/自动放行/撤销均写入只增 `decisions`
+     （kind=`pending`），自动放行另写 `approvals(permitted)`。
+   - **重导守卫**：存在未决待行项时拒绝重新导入站场（409 `pending_exists`）。
+   - **重启可见且可续兑**：队列持久化，重启后队列与结果仍在；启动时按当前
+     占用/锁状态尝试兑现一次，随后整批上报/复位等触发点可继续兑现。
+   - 原“**申请放行**”即时裁决（冲突即写只增拒绝、红灯）与事件幂等语义
+     **保持不变**。
+
+6. **不可追溯改写**：`events / event_results / approvals / decisions` 为只增表，
    SQLite 触发器禁止 UPDATE/DELETE。当前锁闭/占用状态独立维护。
 
-6. **重启恢复与回放**：重启后页面自动显示当前锁闭与占用；“**回放裁决**”按时间
-   正序回放所有历史裁决并在图上高亮，亦可通过 `/api/replay` 拉取。
+7. **重启恢复与回放**：重启后页面自动显示当前锁闭、占用与待行队列；“**回放裁决**”
+   按时间正序回放所有历史裁决（含待行入队/自动放行/撤销）并在图上高亮，亦可通过
+   `/api/replay` 拉取。
 
 ### 页面操作
 
-- **进路放行**：右侧“进路放行”卡片 → “选中看图”预览资源 → “申请放行”，
-  绿灯/红灯及冲突依据就地显示；
+- **进路放行**：右侧“进路放行”卡片 → “选中看图”预览资源 → “申请放行”
+  （即时裁决，绿灯/红灯及冲突依据就地显示）或“**待行申请**”（入队自动排队）；
+- **待行进路队列**：显示每项 `#序号 进路` 与“等待中/自动放行/已撤销”状态，
+  等待中项带“撤销”按钮；自动放行可在上报/复位结果区看到放行提示；
 - **检测上报**：选检测器、occupy/clear、填序号（默认自动跟随“下一期望序号”），
   支持故意发乱序/越序报文观察缓冲与故障；
 - **锁闭与实例**：实时显示活动/故障/完成实例，故障实例带“故障复位”按钮；
-- **裁决记录**：底部表格只增追加，可按类型过滤、加载更早、点击行高亮相关区段。
+- **裁决记录**：底部表格只增追加（可用“待行”类型过滤），可加载更早、点击行
+  高亮相关区段。
 
 ---
 
@@ -161,12 +194,14 @@ curl -s -X POST http://localhost:8000/api/yard \
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET  | `/api/health` | 健康检查 |
-| POST | `/api/yard` | 导入/替换站场（返回 422 校验错误明细） |
-| GET  | `/api/state` | 当前快照：站场、序号/缓冲、占用、锁、实例 |
-| POST | `/api/routes/request` | 申请放行 `{route_id}` |
-| POST | `/api/events` | 检测上报 `{seq, detector_id, kind}` |
-| POST | `/api/reset` | 故障复位 `{instance_id}` |
-| GET  | `/api/decisions?before_id=&limit=&kind=&route_id=` | 裁决倒序分页 |
+| POST | `/api/yard` | 导入/替换站场（返回 422 校验错误明细；有未决待行项 409） |
+| GET  | `/api/state` | 当前快照：站场、序号/缓冲、占用、锁、实例、**待行队列** |
+| POST | `/api/routes/request` | 即时放行 `{route_id}`（冲突写只增拒绝，红灯） |
+| POST | `/api/routes/pending` | 提交待行申请 `{route_id}`，入队后尝试兑现；重复提交返回原申请 |
+| POST | `/api/routes/pending/revoke` | 撤销未放行待行项 `{pending_id}`（已放行/撤销 409） |
+| POST | `/api/events` | 检测上报 `{seq, detector_id, kind}`，整批排空后尝试兑现 |
+| POST | `/api/reset` | 故障复位 `{instance_id}`，成功后尝试兑现 |
+| GET  | `/api/decisions?before_id=&limit=&kind=&route_id=` | 裁决倒序分页（`kind=pending` 看待行） |
 | GET  | `/api/replay?after_id=&limit=` | 裁决正序回放 |
 
 上报示例：
@@ -176,8 +211,26 @@ curl -s -X POST localhost:8000/api/events -H 'Content-Type: application/json' \
   -d '{"seq":1,"detector_id":"D0","kind":"occupy"}'
 ```
 
+待行申请示例：
+
+```bash
+# 入队（资源空闲即自动放行，status=granted；否则 status=waiting）
+curl -s -X POST localhost:8000/api/routes/pending \
+  -H 'Content-Type: application/json' -d '{"route_id":"R-SIDING"}'
+# 撤销等待中的申请 #3
+curl -s -X POST localhost:8000/api/routes/pending/revoke \
+  -H 'Content-Type: application/json' -d '{"pending_id":3}'
+```
+
 返回字段中 `buffered:true` 表示进入缺号缓冲；`duplicate:true` 为幂等重放；
-`processed[].fault:true` 表示该条引发故障锁闭。
+`processed[].fault:true` 表示该条引发故障锁闭；待行相关字段：
+
+- `POST /api/routes/pending`：`queued:true`，`status` 为 `waiting|granted|revoked`，
+  `duplicate:true` 表示命中同进路未决申请并返回原项，`granted_now:true` 表示本轮
+  即自动放行（附 `approval_id`、`instance_id`、`signal:"green"`）；
+- `POST /api/events`、`POST /api/reset` 成功响应中的 `granted_pending[]` 列出该事务
+  内自动放行的待行项（`pending_id/route_id/approval_id/instance_id`）；
+- `GET /api/state` 的 `pending[]` 给出全部待行项及当前状态、关联实例/批准号。
 
 ---
 
@@ -191,7 +244,11 @@ python3 -m pytest -q
 覆盖：导入校验（不连通/引用缺失/道岔位置）、互斥放行、顺序推进与逐段释放、
 末段出清时前段仍占用的故障锁闭（保留全部锁、阻止冲突放行、全段空闲后复位）、
 已释放段外部再占用不误判故障、缺号缓冲与排空、同序幂等/异内容拒绝、
-越序占用/出清故障、复位前置条件、只增触发器拦截、重启状态恢复与裁决回放。
+越序占用/出清故障、复位前置条件、只增触发器拦截、重启状态恢复与裁决回放；
+待行队列覆盖：空闲即原子放行（实例+区段/道岔/侧防锁）、冲突等待不写拒绝、
+重复提交返回原申请、整批上报后排空自动兑现、FIFO 越过（仅不与受阻前项争用时）
+与其争用等待、缺号期间全部等待、故障持锁继续等待与复位后兑现、撤销与终态
+不可撤销、有未决项拒绝重导、重启队列可见且可继续兑现，以及 REST 端到端。
 
 性能压测（SQLite 主键/索引 + 单写事务串行化）：
 

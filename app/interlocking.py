@@ -16,6 +16,12 @@
 * 检测序号从 1 连续：缺号时报文缓冲，禁止新放行与解锁；缓冲按序补处理。
 * 同序同内容幂等返回原裁决；同序异内容拒绝。
 * 越序占用/出清使相关进路故障锁闭；故障复位须确认全段空闲。
+* 待行进路队列：调度员提交待行申请（waiting），在入队、整批上报排空、
+  故障复位成功、重启恢复后于同一事务内尝试兑现（granted），未放行可撤销
+  （revoked）。等待试探与正式批准共用同一套只读资源判定并处于同一
+  BEGIN IMMEDIATE 事务：试探受阻不写拒绝记录，故重试不产生假拒绝；批准时
+  原子建立实例与区段/道岔/侧防锁。较早申请受阻时，后项仅在不与任一受阻
+  前项争用资源时才可越过；缺号期间全部等待，故障持锁的冲突项继续等待。
 * 事件、批准、裁决均为只增表，不可追溯改写。
 """
 
@@ -172,10 +178,22 @@ def import_yard(conn: sqlite3.Connection, raw: Any) -> dict:
                     "存在缺号缓冲报文，拒绝重新导入",
                     {"buffered": _buffered_count(conn)},
                 )
+            pending = conn.execute(
+                "SELECT COUNT(*) AS c FROM pending_requests WHERE yard_id=? AND status='waiting'",
+                (existing,),
+            ).fetchone()["c"]
+            if pending:
+                raise ClientError(
+                    409,
+                    "pending_exists",
+                    f"存在 {pending} 条未决待行申请，拒绝重新导入（请先撤销或等待放行）",
+                    {"waiting_pending": pending},
+                )
             # 清运行态与旧配置（日志保留、序号永不回退）
             conn.execute("DELETE FROM locks")
             conn.execute("DELETE FROM occupancy")
             conn.execute("DELETE FROM instances")
+            conn.execute("DELETE FROM pending_requests")
             conn.execute("DELETE FROM detectors")
             conn.execute("DELETE FROM routes")
             conn.execute("DELETE FROM resources")
@@ -238,55 +256,150 @@ def import_yard(conn: sqlite3.Connection, raw: Any) -> dict:
 # --------------------------------------------------------------------- #
 # 放行裁决
 # --------------------------------------------------------------------- #
+def _wanted_resources(route: dict) -> list[tuple[str, str, str | None]]:
+    """进路需要的全部互斥资源：(resource_type, resource_id, switch_position)。
+
+    区段、道岔（含位置）、侧防——等待试探与正式批准共用此清单，保证两者
+    的资源判定完全一致。
+    """
+    wanted: list[tuple[str, str, str | None]] = [("section", sid, None) for sid in route["sections"]]
+    wanted += [("switch", wid, pos) for wid, pos in route["switches"].items()]
+    wanted += [("flank", fid, None) for fid in route["flank"]]
+    return wanted
+
+
+def _route_conflicts(conn: sqlite3.Connection, yard_id: str, route: dict) -> list[dict]:
+    """只读资源判定（不写任何只增记录）。
+
+    在调用方持有的事务内按当前已提交状态核对：
+    * 进路每一区段“已知空闲”（occupancy 表）；
+    * 区段、道岔、侧防资源均未被其他进路锁定（locks 表，故障实例的锁保留）。
+
+    因为整个“试探 → 批准”序列都在同一个 BEGIN IMMEDIATE 写事务内，试探
+    读到的状态在批准前不会被任何并发写改变；试探受阻时不写拒绝记录，
+    随后状态变化再重试即可，因此重试不会产生只增拒绝（不假拒绝）。
+    """
+    sections: list[str] = route["sections"]
+    conflicts: list[dict] = []
+    occupied_rows = conn.execute(
+        f"SELECT section_id, occupied FROM occupancy WHERE yard_id=? AND section_id IN "
+        f"({','.join('?' * len(sections))})",
+        (yard_id, *sections),
+    ).fetchall()
+    for row in occupied_rows:
+        if row["occupied"]:
+            conflicts.append({"type": "section_occupied", "resource": row["section_id"]})
+
+    for rtype, rid, _pos in _wanted_resources(route):
+        row = conn.execute(
+            "SELECT route_id, instance_id, switch_position FROM locks "
+            "WHERE yard_id=? AND resource_type=? AND resource_id=?",
+            (yard_id, rtype, rid),
+        ).fetchone()
+        if row:
+            conflicts.append(
+                {
+                    "type": f"{rtype}_locked",
+                    "resource": rid,
+                    "held_by_route": row["route_id"],
+                    "held_by_instance": row["instance_id"],
+                }
+            )
+    return _dedup_conflicts(conflicts)
+
+
+def _grant(
+    conn: sqlite3.Connection,
+    yard_id: str,
+    route: dict,
+    now: float,
+    source: str = "immediate",
+    pending_id: int | None = None,
+) -> dict:
+    """正式批准：原子建立只增批准记录、进路实例与全部区段/道岔/侧防锁。
+
+    调用方必须已在事务内、且已用同一套 :func:`_route_conflicts` 判定无冲突；
+    批准行、实例行、逐资源锁行在同一事务内写入，要么全部生效要么全部回滚。
+    ``source`` 为 ``immediate``（即时放行）或 ``pending``（待行自动放行）。
+    """
+    route_id = route["id"]
+    sections = route["sections"]
+    switches = route["switches"]
+    flanks = route["flank"]
+    wanted = _wanted_resources(route)
+
+    cur = conn.execute(
+        "INSERT INTO approvals(yard_id, route_id, decision, signal, reasons, created_at) "
+        "VALUES(?,?, 'permitted', 'green', '[]', ?)",
+        (yard_id, route_id, now),
+    )
+    approval_id = int(cur.lastrowid)
+    cur = conn.execute(
+        "INSERT INTO instances(yard_id, route_id, status, position, final_cleared, approval_id, created_at) "
+        "VALUES(?,?, 'active', -1, 0, ?, ?)",
+        (yard_id, route_id, approval_id, now),
+    )
+    instance_id = int(cur.lastrowid)
+    for rtype, rid, pos in wanted:
+        conn.execute(
+            "INSERT INTO locks(yard_id, resource_type, resource_id, route_id, instance_id, "
+            "switch_position, locked_at) VALUES(?,?,?,?,?,?,?)",
+            (yard_id, rtype, rid, route_id, instance_id, pos, now),
+        )
+
+    locked = [
+        {"type": t, "resource": r, **({"switch_position": p} if p else {})}
+        for t, r, p in wanted
+    ]
+    detail = {
+        "decision": "permitted",
+        "signal": "green",
+        "instance_id": instance_id,
+        "sections": sections,
+        "switches": switches,
+        "flank": flanks,
+        "source": source,
+    }
+    if source == "pending":
+        detail["pending_id"] = pending_id
+        _add_decision(
+            conn,
+            "pending",
+            f"待行 #{pending_id} 自动放行进路 {route_id}（实例 #{instance_id}），信号绿灯",
+            detail,
+            ref=str(pending_id),
+            route_id=route_id,
+            instance_id=instance_id,
+        )
+    else:
+        _add_decision(
+            conn,
+            "approval",
+            f"批准放行进路 {route_id}（实例 #{instance_id}），信号绿灯",
+            detail,
+            ref=str(approval_id),
+            route_id=route_id,
+            instance_id=instance_id,
+        )
+    return {
+        "decision": "permitted",
+        "signal": "green",
+        "approval_id": approval_id,
+        "instance_id": instance_id,
+        "route_id": route_id,
+        "locked": locked,
+    }
+
+
 def request_route(conn: sqlite3.Connection, route_id: str) -> dict:
+    """即时放行：事务内判定，冲突写只增拒绝记录（红灯），否则原子批准。"""
     with transaction(conn):
         yard_id = _active_yard(conn)
         _assert_no_gap(conn)
         route = _route_data(conn, yard_id, route_id)
-        sections: list[str] = route["sections"]
-        switches: dict[str, str] = route["switches"]
-        flanks: list[str] = route["flank"]
         now = _now()
 
-        # 1) 各区段已知空闲
-        occupied_rows = conn.execute(
-            f"SELECT section_id, occupied FROM occupancy WHERE yard_id=? AND section_id IN "
-            f"({','.join('?' * len(sections))})",
-            (yard_id, *sections),
-        ).fetchall()
-        conflicts: list[dict] = []
-        for row in occupied_rows:
-            if row["occupied"]:
-                conflicts.append({"type": "section_occupied", "resource": row["section_id"]})
-
-        # 2) 资源锁互斥（区段 / 道岔 / 侧防）
-        wanted: list[tuple[str, str, str | None]] = []
-        for sid in sections:
-            wanted.append(("section", sid, None))
-        for wid, pos in switches.items():
-            wanted.append(("switch", wid, pos))
-        for fid in flanks:
-            wanted.append(("flank", fid, None))
-
-        for rtype, rid, _pos in wanted:
-            row = conn.execute(
-                "SELECT route_id, instance_id, switch_position FROM locks "
-                "WHERE yard_id=? AND resource_type=? AND resource_id=?",
-                (yard_id, rtype, rid),
-            ).fetchone()
-            if row:
-                conflicts.append(
-                    {
-                        "type": f"{rtype}_locked",
-                        "resource": rid,
-                        "held_by_route": row["route_id"],
-                        "held_by_instance": row["instance_id"],
-                    }
-                )
-
-        # 3) 故障实例保留其全部锁闭，上面的资源锁检查已逐项体现为 *_locked 冲突依据。
-
-        reasons = _dedup_conflicts(conflicts)
+        reasons = _route_conflicts(conn, yard_id, route)
         if reasons:
             cur = conn.execute(
                 "INSERT INTO approvals(yard_id, route_id, decision, signal, reasons, created_at) "
@@ -310,52 +423,172 @@ def request_route(conn: sqlite3.Connection, route_id: str) -> dict:
                 "conflicts": reasons,
             }
 
-        # 4) 批准：建实例、锁资源
-        cur = conn.execute(
-            "INSERT INTO approvals(yard_id, route_id, decision, signal, reasons, created_at) "
-            "VALUES(?,?, 'permitted', 'green', '[]', ?)",
-            (yard_id, route_id, now),
+        return _grant(conn, yard_id, route, now, source="immediate")
+
+
+# --------------------------------------------------------------------- #
+# 待行进路队列
+# --------------------------------------------------------------------- #
+def _pending_row(conn: sqlite3.Connection, yard_id: str, pending_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM pending_requests WHERE yard_id=? AND id=?", (yard_id, pending_id)
+    ).fetchone()
+
+
+def _try_fulfill(conn: sqlite3.Connection, yard_id: str) -> list[dict]:
+    """按 FIFO 尝试兑现全部等待中的待行项（调用方须已在写事务内）。
+
+    扫描规则（一轮即可收敛：被批准项即刻持锁，受阻项不再移动）：
+
+    * **缺号期间全部等待**：存在缺号缓冲时不兑现任何待行项；
+    * **等待试探与正式批准同一事务**：每项先用 :func:`_route_conflicts`
+      只读试探，受阻**不写任何拒绝记录**（重试不会产生只增假拒绝），
+      无冲突则同一事务内 :func:`_grant` 原子建立批准/实例/锁；
+    * **较早受阻则后项不得争用**：维护本轮受阻前项的资源并集，后项仅在
+      既不与任何实际锁/占用冲突、也**不与任一受阻前项争用资源**时才可
+      越过放行，否则一并等待；
+    * **故障持锁的冲突项继续等待**：故障实例锁保留，体现在 *_locked 判定中。
+    """
+    granted: list[dict] = []
+    if _buffered_count(conn):
+        return granted  # 缺号期间全部等待，禁止新放行
+
+    rows = conn.execute(
+        "SELECT * FROM pending_requests WHERE yard_id=? AND status='waiting' ORDER BY id",
+        (yard_id,),
+    ).fetchall()
+    blocked_union: set[tuple[str, str]] = set()  # 本轮受阻前项的期望资源并集
+    for row in rows:
+        route = json.loads(
+            conn.execute("SELECT data FROM routes WHERE yard_id=? AND route_id=?",
+                         (yard_id, row["route_id"])).fetchone()["data"]
         )
-        approval_id = int(cur.lastrowid)
-        cur = conn.execute(
-            "INSERT INTO instances(yard_id, route_id, status, position, final_cleared, approval_id, created_at) "
-            "VALUES(?,?, 'active', -1, 0, ?, ?)",
-            (yard_id, route_id, approval_id, now),
+        wanted_keys = {(t, r) for t, r, _p in _wanted_resources(route)}
+        real_conflicts = _route_conflicts(conn, yard_id, route)
+        if real_conflicts or (wanted_keys & blocked_union):
+            # 自身受阻：其期望资源并入受阻并集，挡住后续争用同资源的后项
+            blocked_union |= wanted_keys
+            continue
+        # 无冲突且不与任何受阻前项争用：原子兑现
+        res = _grant(conn, yard_id, route, _now(), source="pending", pending_id=row["id"])
+        conn.execute(
+            "UPDATE pending_requests SET status='granted', approval_id=?, instance_id=?, updated_at=? "
+            "WHERE id=?",
+            (res["approval_id"], res["instance_id"], _now(), row["id"]),
         )
-        instance_id = int(cur.lastrowid)
-        for rtype, rid, pos in wanted:
-            conn.execute(
-                "INSERT INTO locks(yard_id, resource_type, resource_id, route_id, instance_id, "
-                "switch_position, locked_at) VALUES(?,?,?,?,?,?,?)",
-                (yard_id, rtype, rid, route_id, instance_id, pos, now),
-            )
+        granted.append(
+            {
+                "pending_id": row["id"],
+                "route_id": row["route_id"],
+                "approval_id": res["approval_id"],
+                "instance_id": res["instance_id"],
+            }
+        )
+    return granted
+
+
+def _pending_payload(row: sqlite3.Row, granted: list[dict] | None = None) -> dict:
+    item = {
+        "id": row["id"],
+        "route_id": row["route_id"],
+        "status": row["status"],
+        "approval_id": row["approval_id"],
+        "instance_id": row["instance_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if granted is not None:
+        hit = next((g for g in granted if g["pending_id"] == row["id"]), None)
+        item["granted_now"] = bool(hit)
+        if hit:
+            item["decision"] = "permitted"
+            item["signal"] = "green"
+    return item
+
+
+def submit_pending(conn: sqlite3.Connection, route_id: str) -> dict:
+    """调度员提交待行申请：入队后立即按最新状态尝试兑现。
+
+    * 同一进路已有未决（waiting）待行项时，重复提交返回原申请（幂等），
+      并按最新状态再尝试兑现；
+    * 缺号期间允许入队（全部等待），缺号补齐后排空事务会自动兑现；
+    * 入队与兑现尝试在同一事务：本轮被批准的项原子取得实例与全部锁，
+      试探受阻不写拒绝记录。
+    """
+    with transaction(conn):
+        yard_id = _active_yard(conn)
+        _route_data(conn, yard_id, route_id)  # 进路不存在 → 404
+        now = _now()
+
+        existing = conn.execute(
+            "SELECT * FROM pending_requests WHERE yard_id=? AND route_id=? AND status='waiting' "
+            "ORDER BY id",
+            (yard_id, route_id),
+        ).fetchone()
+        if existing:
+            granted = _try_fulfill(conn, yard_id)
+            row = _pending_row(conn, yard_id, existing["id"])
+            return {"queued": True, "duplicate": True, **_pending_payload(row, granted)}
+
+        cur = conn.execute(
+            "INSERT INTO pending_requests(yard_id, route_id, status, created_at, updated_at) "
+            "VALUES(?,?, 'waiting', ?, ?)",
+            (yard_id, route_id, now, now),
+        )
+        pending_id = int(cur.lastrowid)
         _add_decision(
             conn,
-            "approval",
-            f"批准放行进路 {route_id}（实例 #{instance_id}），信号绿灯",
-            {
-                "decision": "permitted",
-                "signal": "green",
-                "instance_id": instance_id,
-                "sections": sections,
-                "switches": switches,
-                "flank": flanks,
-            },
-            ref=str(approval_id),
+            "pending",
+            f"待行进路 {route_id} 入队（申请 #{pending_id}）",
+            {"event": "enqueue", "pending_id": pending_id, "route_id": route_id},
+            ref=str(pending_id),
             route_id=route_id,
-            instance_id=instance_id,
         )
-        return {
-            "decision": "permitted",
-            "signal": "green",
-            "approval_id": approval_id,
-            "instance_id": instance_id,
-            "route_id": route_id,
-            "locked": [
-                {"type": t, "resource": r, **({"switch_position": p} if p else {})}
-                for t, r, p in wanted
-            ],
-        }
+        granted = _try_fulfill(conn, yard_id)
+        row = _pending_row(conn, yard_id, pending_id)
+        return {"queued": True, **_pending_payload(row, granted)}
+
+
+def revoke_pending(conn: sqlite3.Connection, pending_id: int) -> dict:
+    """撤销未放行（waiting）的待行项；granted/revoked 不可撤销（409）。"""
+    with transaction(conn):
+        yard_id = _active_yard(conn)
+        row = _pending_row(conn, yard_id, pending_id)
+        if not row:
+            raise ClientError(404, "pending_not_found", f"待行申请 #{pending_id} 不存在")
+        if row["status"] != "waiting":
+            verb = "放行" if row["status"] == "granted" else "撤销"
+            raise ClientError(
+                409,
+                "pending_not_waiting",
+                f"待行申请 #{pending_id} 已{verb}，不能撤销",
+                {"status": row["status"]},
+            )
+        now = _now()
+        conn.execute(
+            "UPDATE pending_requests SET status='revoked', updated_at=? WHERE id=?",
+            (now, pending_id),
+        )
+        _add_decision(
+            conn,
+            "pending",
+            f"撤销待行进路 {row['route_id']}（申请 #{pending_id}）",
+            {"event": "revoke", "pending_id": pending_id, "route_id": row["route_id"]},
+            ref=str(pending_id),
+            route_id=row["route_id"],
+        )
+        # 撤销后其后项可能不再与“受阻前项”争用，按最新状态再兑现一轮
+        granted = _try_fulfill(conn, yard_id)
+        return {"id": pending_id, "status": "revoked", "revoked": True, "granted": granted}
+
+
+def startup_recover(conn: sqlite3.Connection) -> dict:
+    """重启恢复：队列本身持久化（快照可见），重启后按最新状态兑现一次。"""
+    with transaction(conn):
+        yard_id = _get_meta(conn, "active_yard")
+        if not yard_id:
+            return {"granted": []}
+        return {"granted": _try_fulfill(conn, yard_id)}
 
 
 def _dedup_conflicts(conflicts: list[dict]) -> list[dict]:
@@ -494,12 +727,15 @@ def report_event(conn: sqlite3.Connection, payload: dict) -> dict:
             _set_meta(conn, "next_seq", cursor + 1)
             cursor += 1
 
+        # 整批上报在同一事务内排空并更新占用与锁后，依据最新状态尝试兑现待行队列
+        granted = _try_fulfill(conn, yard_id)
         return {
             "seq": seq,
             "status": "processed",
             "expected": cursor,
             "drained": len(results),
             "processed": results,
+            "granted_pending": granted,
         }
 
 
@@ -829,7 +1065,9 @@ def reset_instance(conn: sqlite3.Connection, instance_id: int) -> dict:
             route_id=inst["route_id"],
             instance_id=instance_id,
         )
-        return {"instance_id": instance_id, "reset": True}
+        # 复位成功后锁释放，依据最新状态尝试兑现待行队列（同一事务）
+        granted = _try_fulfill(conn, yard_id)
+        return {"instance_id": instance_id, "reset": True, "granted_pending": granted}
 
 
 # --------------------------------------------------------------------- #
@@ -843,6 +1081,7 @@ def snapshot(conn: sqlite3.Connection) -> dict:
             "yard": None,
             "next_seq": int(_get_meta(conn, "next_seq", "1")),
             "buffered": buffered,
+            "pending": [],
         }
     yrow = conn.execute("SELECT config, imported_at FROM yards WHERE yard_id=?", (yard_id,)).fetchone()
     yard = json.loads(yrow["config"])
@@ -873,6 +1112,20 @@ def snapshot(conn: sqlite3.Connection) -> dict:
             "SELECT * FROM instances WHERE yard_id=? ORDER BY id", (yard_id,)
         ).fetchall()
     ]
+    pending = [
+        {
+            "id": r["id"],
+            "route_id": r["route_id"],
+            "status": r["status"],
+            "approval_id": r["approval_id"],
+            "instance_id": r["instance_id"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM pending_requests WHERE yard_id=? ORDER BY id", (yard_id,)
+        ).fetchall()
+    ]
     total_events = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
     return {
         "yard_id": yard_id,
@@ -883,6 +1136,7 @@ def snapshot(conn: sqlite3.Connection) -> dict:
         "occupancy": occupancy,
         "locks": locks,
         "instances": instances,
+        "pending": pending,
     }
 
 

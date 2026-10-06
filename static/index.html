@@ -48,6 +48,15 @@
       </section>
 
       <section class="panel">
+        <div class="panel-head">
+          <h2>待行进路队列</h2>
+          <span class="muted" id="pendingHint"></span>
+        </div>
+        <div id="pendingList" class="pending-list"><p class="muted">无</p></div>
+        <p class="hint">提交待行后自动排队：资源空闲即自动放行；较早申请受阻时，后项仅在不与其争用资源时越过。缺号期间全部等待。</p>
+      </section>
+
+      <section class="panel">
         <h2>检测上报</h2>
         <div class="form-row">
           <label>检测器</label>
@@ -88,6 +97,7 @@
           <option value="fault">故障</option>
           <option value="complete">完成</option>
           <option value="reset">复位</option>
+          <option value="pending">待行</option>
         </select>
         <button class="btn" id="olderBtn">加载更早</button>
       </div>

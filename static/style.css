@@ -91,6 +91,7 @@ input, select {
 .result { margin-top: 8px; font-size: 13px; }
 .result.small { font-size: 12px; max-height: 120px; overflow: auto; }
 .result .ok { color: #6fd38e; }
+.result .warn { color: #ffd479; }
 .result .bad { color: #ff8089; }
 .result pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #a9bdd4; }
 
@@ -104,6 +105,17 @@ input, select {
 .badge.faulted { background: #8a2c34; }
 .badge.completed { background: #2c5d3d; }
 
+.pending-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow: auto; }
+.pend { border: 1px solid #2f3c4d; border-radius: 8px; padding: 7px 9px; font-size: 12px; background: #1b242f; }
+.pend .line1 { display: flex; justify-content: space-between; font-weight: 700; }
+.pend .meta2 { font-size: 11px; color: #8fa5bf; margin-top: 2px; }
+.pend.waiting { border-color: #8a6a1f; background: #241f16; }
+.pend.granted { border-color: #2c5d3d; }
+.pend.revoked { opacity: .6; }
+.badge.pending-waiting { background: #8a6a1f; }
+.badge.pending-granted { background: #27613d; }
+.badge.pending-revoked { background: #4a5566; }
+
 .log-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .log-table th, .log-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #242f3d; vertical-align: top; }
 .log-table th { color: #8fa5bf; font-weight: 600; }
@@ -115,6 +127,7 @@ input, select {
 .tag.complete { background: #27613d; }
 .tag.reset { background: #7a5a1f; }
 .tag.import { background: #4a3a7a; }
+.tag.pending { background: #8a6a1f; }
 
 .modal { position: fixed; inset: 0; background: rgba(5, 8, 12, .72); display: flex; align-items: center; justify-content: center; z-index: 20; }
 .modal.hidden { display: none; }

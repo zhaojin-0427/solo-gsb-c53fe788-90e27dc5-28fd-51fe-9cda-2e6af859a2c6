@@ -29,6 +29,9 @@ _conn = connect()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 重启恢复：待行队列持久化，启动后依据当前占用/锁状态尝试兑现一次
+    with _db_lock:
+        il.startup_recover(_conn)
     yield
 
 
@@ -45,6 +48,14 @@ async def client_error_handler(request: Request, exc: il.ClientError) -> JSONRes
 
 class RouteRequest(BaseModel):
     route_id: str
+
+
+class PendingRequest(BaseModel):
+    route_id: str
+
+
+class PendingRevoke(BaseModel):
+    pending_id: int
 
 
 class ResetRequest(BaseModel):
@@ -73,6 +84,18 @@ async def post_yard(request: Request) -> dict:
 def post_route(body: RouteRequest) -> dict:
     with _db_lock:
         return il.request_route(_conn, body.route_id)
+
+
+@app.post("/api/routes/pending")
+def post_pending(body: PendingRequest) -> dict:
+    with _db_lock:
+        return il.submit_pending(_conn, body.route_id)
+
+
+@app.post("/api/routes/pending/revoke")
+def post_pending_revoke(body: PendingRevoke) -> dict:
+    with _db_lock:
+        return il.revoke_pending(_conn, body.pending_id)
 
 
 @app.post("/api/events")
