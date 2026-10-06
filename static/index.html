@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>站场进路联锁推演台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>站场进路联锁推演台</h1>
+    <div class="seq-status" id="seqStatus">未连接</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel panel-yard">
+      <div class="panel-head">
+        <h2>站场图</h2>
+        <div class="toolbar">
+          <label class="btn">
+            导入站场 JSON
+            <input type="file" id="fileInput" accept=".json,application/json" hidden />
+          </label>
+          <button class="btn" id="replayBtn">回放裁决</button>
+          <label class="poll">
+            <input type="checkbox" id="autoPoll" checked /> 自动刷新
+          </label>
+        </div>
+      </div>
+      <div id="svgWrap" class="svg-wrap">
+        <div class="empty-hint" id="emptyHint">尚未导入站场，请选择站场 JSON 文件（可使用 examples/yard.json）</div>
+        <svg id="yardSvg" viewBox="0 0 960 360" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div class="legend">
+        <span><i class="sw" style="background:#c9c9c9"></i>空闲区段</span>
+        <span><i class="sw" style="background:#e0a800"></i>锁闭</span>
+        <span><i class="sw" style="background:#d9534f"></i>占用</span>
+        <span><i class="sw" style="background:#7a2222"></i>故障锁闭</span>
+        <span><i class="sw" style="background:#2f8f4e"></i>完成/已释放</span>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel">
+        <h2>进路放行</h2>
+        <div id="routeList" class="route-list"><p class="muted">无站场</p></div>
+        <div id="approvalResult" class="result"></div>
+      </section>
+
+      <section class="panel">
+        <h2>检测上报</h2>
+        <div class="form-row">
+          <label>检测器</label>
+          <select id="detectorSel"></select>
+        </div>
+        <div class="form-row">
+          <label>事件</label>
+          <select id="kindSel"><option value="occupy">占用 occupy</option><option value="clear">出清 clear</option></select>
+        </div>
+        <div class="form-row">
+          <label>序号</label>
+          <input type="number" id="seqInput" min="1" value="1" />
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" id="sendEventBtn">上报</button>
+          <button class="btn" id="nextSeqBtn" title="填入当前期望序号">用期望序号</button>
+        </div>
+        <p class="hint" id="eventHint"></p>
+        <div id="eventResult" class="result small"></div>
+      </section>
+
+      <section class="panel">
+        <h2>锁闭与进路实例</h2>
+        <div id="instanceList" class="instance-list"><p class="muted">无</p></div>
+      </section>
+    </aside>
+  </main>
+
+  <section class="panel panel-log">
+    <div class="panel-head">
+      <h2>裁决记录（只增，重启后仍可回放）</h2>
+      <div class="toolbar">
+        <select id="kindFilter">
+          <option value="">全部类型</option>
+          <option value="import">导入</option>
+          <option value="approval">放行</option>
+          <option value="event">事件</option>
+          <option value="fault">故障</option>
+          <option value="complete">完成</option>
+          <option value="reset">复位</option>
+        </select>
+        <button class="btn" id="olderBtn">加载更早</button>
+      </div>
+    </div>
+    <table class="log-table">
+      <thead><tr><th>#</th><th>类型</th><th>进路</th><th>摘要</th><th>时间</th></tr></thead>
+      <tbody id="logBody"></tbody>
+    </table>
+  </section>
+
+  <div id="replayModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>历史裁决回放</h3>
+        <button class="btn" id="closeReplay">关闭</button>
+      </div>
+      <div class="replay-controls">
+        <button class="btn" id="replayStart">从头播放</button>
+        <label>速度 <input type="range" id="replaySpeed" min="120" max="2000" value="600" /></label>
+      </div>
+      <ol id="replayList" class="replay-list"></ol>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

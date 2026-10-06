@@ -1,0 +1,15 @@
+services:
+  interlocking:
+    build: .
+    image: yard-interlocking:latest
+    container_name: yard-interlocking
+    ports:
+      - "8000:8000"
+    volumes:
+      - interlocking-data:/data
+    environment:
+      INTERLOCKING_DB: /data/interlocking.db
+    restart: unless-stopped
+
+volumes:
+  interlocking-data:

@@ -1,0 +1,55 @@
+{
+  "yard_id": "demo-yard-01",
+  "name": "示例站场（单渡线侧线）",
+  "nodes": [
+    {"id": "N0", "x": 60, "y": 240},
+    {"id": "N1", "x": 240, "y": 240},
+    {"id": "N2", "x": 470, "y": 240},
+    {"id": "N3", "x": 700, "y": 240},
+    {"id": "N4", "x": 900, "y": 240},
+    {"id": "N1U", "x": 300, "y": 110},
+    {"id": "N3U", "x": 640, "y": 110}
+  ],
+  "sections": [
+    {"id": "S0", "a": "N0", "b": "N1", "detector": "D0"},
+    {"id": "S1", "a": "N1", "b": "N2", "detector": "D1"},
+    {"id": "S2", "a": "N2", "b": "N3", "detector": "D2"},
+    {"id": "S3", "a": "N3", "b": "N4", "detector": "D3"},
+    {"id": "S1U", "a": "N1", "b": "N1U", "detector": "D1U"},
+    {"id": "S2U", "a": "N1U", "b": "N3U", "detector": "D2U"},
+    {"id": "S3U", "a": "N3U", "b": "N3", "detector": "D3U"}
+  ],
+  "switches": [
+    {"id": "SW1", "node": "N1", "positions": ["straight", "diverging"]},
+    {"id": "SW2", "node": "N3", "positions": ["straight", "diverging"]}
+  ],
+  "resources": [
+    {"id": "FP-EAST", "kind": "generic", "ref": "east-approach-protection"},
+    {"id": "FP-WEST", "kind": "generic", "ref": "west-approach-protection"},
+    {"id": "FP-S3U-SEC", "kind": "section", "ref": "S3U"},
+    {"id": "FP-SW1", "kind": "switch", "ref": "SW1"}
+  ],
+  "routes": [
+    {
+      "id": "R-MAIN",
+      "name": "正线通过 S0→S3",
+      "sections": ["S0", "S1", "S2", "S3"],
+      "switches": {"SW1": "straight", "SW2": "straight"},
+      "flank": ["FP-EAST", "FP-WEST"]
+    },
+    {
+      "id": "R-SIDING",
+      "name": "侧线通过 S0→渡线→S3",
+      "sections": ["S0", "S1U", "S2U", "S3U", "S3"],
+      "switches": {"SW1": "diverging", "SW2": "diverging"},
+      "flank": ["FP-EAST", "FP-SW1"]
+    },
+    {
+      "id": "R-BACK",
+      "name": "折返进路 S3→S2→S1",
+      "sections": ["S3", "S2", "S1"],
+      "switches": {"SW2": "straight", "SW1": "straight"},
+      "flank": ["FP-WEST", "FP-S3U-SEC"]
+    }
+  ]
+}
